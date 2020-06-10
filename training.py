@@ -63,8 +63,8 @@ class BoxNet(nn.Module):
         self.adj_conv2 = nn.Conv1D(32, 1, 5, padding=2)
         self.adj_linear = nn.Linear(MRNA_INPUT_LEN // 4, 2)
 
-    def forward(self, piRNA, pyramid_fmap):
-        box_in = self.pi_conv(piRNA) + pyramid_fmap
+    def forward(self, piRNA, py_sec):
+        box_in = self.pi_conv(piRNA) + py_sec
 
         cls_o = self.cls_conv1(box_in)
         cls_o = self.cls_conv2(cls_o)
@@ -110,10 +110,12 @@ def seq2onehot(seq, lut):
     encoded = np.array(encoded)
     return encoded.transpose(1, 0)
 
-def binding_label(binding, start, end, mapback_len):
+def binding_label(binding, start, end, buff_len, ratio):
 
-    binding_shifted_start = max(binding["site_location"]["from"] - mapback_len, 0)
-    binding_shifted_end = min(binding["site_location"]["to"] + mapback_len, end)
+    assert(ratio > 1)
+    binding_shifted_start = max(binding["site_location"]["from"] - buff_len, 0)
+    binding_shifted_end = min(binding["site_location"]["to"] + buff_len, end)
+    affined_start = binding_shifted_start
 
     if end <= binding_shifted_start or start > binding_shifted_end:
         # [======] binding
@@ -121,52 +123,52 @@ def binding_label(binding, start, end, mapback_len):
         #           or
         #                          [======] binding
         # ----------^------------^----
-        container = np.empty((MRNA_INPUT_LEN, 2))
+        container = np.empty((MRNA_INPUT_LEN // ratio, 2))
         container[:] = [0., 1.]
         return container
     elif end > binding_shifted_end and binding_shifted_start <= start <= binding_shifted_end:
 
         #       [======] binding
         # ----------^------------^----
-        overlap = np.empty((end - start, 2))
+        overlap = np.empty(((end - start) // ratio, 2))
         overlap[:] = [0., 1.]
-        overlap[: binding_shifted_end - start] = [1., 0.]
-        return np.concatenate((overlap, np.zeros((MRNA_INPUT_LEN - len(overlap), 2))), axis=0)
+        overlap[: (binding_shifted_end - start) // ratio] = [1., 0.]
+        return np.concatenate((overlap, np.zeros((MRNA_INPUT_LEN // ratio - len(overlap), 2))), axis=0)
 
     elif end >= binding_shifted_end and start <= binding_shifted_start:
 
         #              [======] binding
         # ----------^------------^----
-        overlap = np.zeros((end - start, 2))
+        overlap = np.zeros(((end - start) // ratio, 2))
         overlap[:] = [0., 1.]
-        overlap[binding_shifted_start - start: binding_shifted_end - start] = [1., 0.]
-        return np.concatenate((overlap, np.zeros((MRNA_INPUT_LEN - len(overlap), 2))), axis=0)
+        overlap[(binding_shifted_start - start) // ratio: (binding_shifted_end - start) // ratio] = [1., 0.]
+        return np.concatenate((overlap, np.zeros((MRNA_INPUT_LEN // ratio - len(overlap), 2))), axis=0)
     elif binding_shifted_end > end > binding_shifted_start and start <= binding_shifted_start:
 
         #                    [======] binding
         # ----------^------------^----
-        overlap = np.zeros((end - start, 2))
+        overlap = np.zeros(((end - start) // ratio, 2))
         overlap[:] = [0., 1.]
-        overlap[binding_shifted_start - start:] = [1., 0.]
-        return np.concatenate((overlap, np.zeros((MRNA_INPUT_LEN - len(overlap), 2))), axis=0)
+        overlap[(binding_shifted_start - start) // ratio:] = [1., 0.]
+        return np.concatenate((overlap, np.zeros((MRNA_INPUT_LEN // ratio - len(overlap), 2))), axis=0)
     elif start > binding_shifted_start and end <= binding_shifted_end:
 
         #       [============] binding
         # ----------^----^------------
-        o = np.empty((end - start, 0))
+        o = np.empty(((end - start) // ratio, 0))
         o[:] = [1., 0.]
-        z = np.zeros((MRNA_INPUT_LEN - len(o), 2), axis=0)
+        z = np.zeros((MRNA_INPUT_LEN // ratio - len(o), 2), axis=0)
         return np.concatenate((o, z))
     else:
         raise f"Binding relation between piRNA and mRNA is unexpected."
 
-def adjustment_label(binding, start, end, mapback_len):
+def adjustment_label(binding, start, end, buff_len, ratio):
 
     adjustment = []
     binding_len = binding["site_location"]["to"] - binding["site_location"]["from"]
-    for i in range(start, end):
-        adjustment.append([binding["site_location"]["from"] - i, binding_len - mapback_len])
-    z = np.zeros((MRNA_INPUT_LEN - len(adjustment), 2))
+    for i in range(start // ratio, end // ratio):
+        adjustment.append([binding["site_location"]["from"] - i * ratio, binding_len - ratio])
+    z = np.zeros((MRNA_INPUT_LEN // ratio - len(adjustment), 2))
     return np.concatenate((np.array(adjustment), z), axis=0)
 
 def preprocess_label(fmap_len, l2nd_input, buffer=0):
@@ -197,8 +199,8 @@ def preprocess_label(fmap_len, l2nd_input, buffer=0):
 
             # Processing is_binding
             np.zeros(MRNA_INPUT_LEN)
-            is_binding.append(binding_label(b, start, end, 4))
-            adjustment.append(adjustment_label(b, start, end, 4))
+            is_binding.append(binding_label(b, start, end, 16, 8))
+            adjustment.append(adjustment_label(b, start, end, 16, 8))
     return np.array(x), np.array(is_binding), np.array(adjustment)
 
 def train():
