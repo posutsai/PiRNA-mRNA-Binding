@@ -8,6 +8,8 @@ from Focal_Loss import *
 from torch import optim
 import sklearn.metrics as metrics
 import numpy as np
+from random import randint
+from math import floor, ceil
 
 MRNA_INPUT_LEN = 1024
 PIRNA_INPUT_LEN = 21
@@ -88,12 +90,12 @@ class BoxNet(nn.Module):
         cls_o = self.cls_conv3(cls_o)
         cls_o = torch.transpose(cls_o, 1, 2)
         cls_o = self.softmax(cls_o)
+        # print(cls_o.shape)
 
         adj_o = self.adj_conv1(box_in)
         adj_o = self.adj_conv2(adj_o)
         adj_o = self.adj_conv3(adj_o)
         adj_o = torch.transpose(adj_o, 1, 2)
-        adj_o = self.softmax(adj_o)
 
         return cls_o, adj_o
 
@@ -141,102 +143,63 @@ def get_binding():
     return pos_binding
 
 def inverse_affine_predict(pred_cls, pred_adj, ratio):
-    assert ratio > 0
-    valid = pred_cls[:, :, 0] > THRESHOLD
-    output = np.zeros((pred_cls.shape[0], MRNA_INPUT_LEN))
-    for s in range(valid.shape[0]):
-        for i, c in enumerate(valid[s]):
-            if c:
-                f = int(pred_adj.cpu().detach().numpy()[s, i, 0] + ratio)
-                l = int(pred_adj.cpu().detach().numpy()[s, i, 1] + i * ratio)
-                e = max(f+l, MRNA_INPUT_LEN // ratio)
+    output_cls = np.argmax(pred_cls.cpu().detach().numpy(), axis=2)
+    uni, cnt = np.unique(output_cls, return_counts=True)
+    print(dict(zip(uni, cnt)))
+    output_adj = pred_adj.cpu().detach().numpy()
+    output = np.zeros((output_cls.shape[0], MRNA_INPUT_LEN))
+    for s in range(output_cls.shape[0]):
+        for i, c in enumerate(output_cls[s]):
+            if c == 1:
+                f = int(output_adj[s, i, 0] * ratio)
+                l = int(output_adj[s, i, 1] + ratio)
+                e = min(f+l, MRNA_INPUT_LEN // ratio)
                 output[s, f: e] = 1
     return output
 
 def seq2onehot(seq, lut):
-    encoded = []
-    for el in seq:
-        encoded.append(lut[el])
-    encoded = np.array(encoded)
+    encoded = map(lambda el: lut[el], list(seq))
+    encoded = np.array(list(encoded))
     return encoded.transpose(1, 0)
 
-def binding_label(binding, start, end, buff_len, ratio):
+def augment_binding(bind, ratio):
+    site_l = len(bind["site_seq"])
+    pad = MRNA_INPUT_LEN - site_l
+    former_space = min(pad, bind["site_location"]["from"])
+    n_window = former_space + min(pad, len(bind["mRNA_seq"]) - bind["site_location"]["to"]) - pad
+    if n_window < 0:
+        return {"validity": False}
+    start_i = bind["site_location"]["from"] - former_space + randint(0, n_window)
 
-    assert ratio > 1
-    binding_shifted_start = max(binding["site_location"]["from"] - buff_len, 0)
-    binding_shifted_end = min(binding["site_location"]["to"] + buff_len, end)
+    eval = np.zeros(MRNA_INPUT_LEN)
+    eval[bind["site_location"]["from"] - start_i: bind["site_location"]["to"]] = 1.
 
-    if end <= binding_shifted_start or start > binding_shifted_end:
-        # [======] binding
-        # ----------^------------^----
-        #           or
-        #                          [======] binding
-        # ----------^------------^----
-        container = np.empty((MRNA_INPUT_LEN // ratio, 2))
-        container[:] = [0., 1.]
-        return container
-    elif end > binding_shifted_end and binding_shifted_start <= start <= binding_shifted_end:
+    train_cls = np.zeros(MRNA_INPUT_LEN // ratio)
+    train_cls[
+        floor(bind["site_location"]["from"] / ratio):
+        ceil(bind["site_location"]["to"] / ratio)
+    ] = 1.
 
-        #       [======] binding
-        # ----------^------------^----
-        overlap = np.empty(((end - start) // ratio, 2))
-        overlap[:] = [0., 1.]
-        overlap[: (binding_shifted_end - start) // ratio] = [1., 0.]
-        return np.concatenate((overlap, np.zeros((MRNA_INPUT_LEN // ratio - len(overlap), 2))), axis=0)
-
-    elif end >= binding_shifted_end and start <= binding_shifted_start:
-
-        #              [======] binding
-        # ----------^------------^----
-        overlap = np.zeros(((end - start) // ratio, 2))
-        overlap[:] = [0., 1.]
-        overlap[(binding_shifted_start - start) // ratio: (binding_shifted_end - start) // ratio] = [1., 0.]
-        return np.concatenate((overlap, np.zeros((MRNA_INPUT_LEN // ratio - len(overlap), 2))), axis=0)
-    elif binding_shifted_end > end > binding_shifted_start and start <= binding_shifted_start:
-
-        #                    [======] binding
-        # ----------^------------^----
-        overlap = np.zeros(((end - start) // ratio, 2))
-        overlap[:] = [0., 1.]
-        overlap[(binding_shifted_start - start) // ratio:] = [1., 0.]
-        return np.concatenate((overlap, np.zeros((MRNA_INPUT_LEN // ratio - len(overlap), 2))), axis=0)
-    elif start > binding_shifted_start and end <= binding_shifted_end:
-
-        #       [============] binding
-        # ----------^----^------------
-        o = np.empty(((end - start) // ratio, 0))
-        o[:] = [1., 0.]
-        z = np.zeros((MRNA_INPUT_LEN // ratio - len(o), 2), axis=0)
-        return np.concatenate((o, z))
-    else:
-        raise f"Binding relation between piRNA and mRNA is unexpected."
-
-def adjustment_label(binding, start, end, buff_len, ratio):
-
-    adjustment = []
-    binding_shifted_start = max(binding["site_location"]["from"] - buff_len, 0)
-    binding_shifted_end = min(binding["site_location"]["to"] + buff_len, end)
-    binding_len = binding["site_location"]["to"] - binding["site_location"]["from"]
-    if end <= binding_shifted_start or start > binding_shifted_end:
-        return np.zeros((MRNA_INPUT_LEN // ratio, 2))
-    for i in range(start // ratio, end // ratio):
-        adjustment.append([binding["site_location"]["from"] - i * ratio, binding_len - ratio])
-    z = np.zeros((MRNA_INPUT_LEN // ratio - len(adjustment), 2))
-    return np.concatenate((np.array(adjustment), z), axis=0)
-
-def eval_label(binding, start, end, buff_len, ratio):
-    b_start = max(binding["site_location"]["from"], 0)
-    b_end = min(binding["site_location"]["to"], end)
-    output = np.zeros(end - start)
-    if end > b_end and b_start <= start <= b_end:
-        output[: b_end - start] = 1.
-    elif end >= b_end and start <= b_start:
-        output[b_start - start: b_end - start] = 1.
-    elif b_end > end > b_start and start <= b_start:
-        output[b_start - start:] = 1.
-    elif start > b_start and end <= b_end:
-        output[:] = 1.
-    return np.concatenate((output, np.zeros(MRNA_INPUT_LEN - len(output))))
+    train_adj = []
+    for i in range(MRNA_INPUT_LEN // ratio):
+        train_adj.append([
+            bind["site_location"]["from"] - (i * ratio + start_i),
+            len(bind["site_seq"]) / ratio
+        ])
+    lut = {
+        'A': [1., 0., 0., 0.],
+        'T': [0., 1., 0., 0.],
+        'C': [0., 0., 1., 0.],
+        'G': [0., 0., 0., 1.],
+    }
+    m = seq2onehot(bind["mRNA_seq"][start_i: start_i + MRNA_INPUT_LEN], lut)
+    return {
+        "validity": True,
+        "eval": eval,
+        "train_cls": train_cls,
+        "train_adj": train_adj,
+        "mRNA": m
+    }
 
 def preprocess_label(buffer=16, mapping_layer=3):
     binding = get_binding()
@@ -246,33 +209,22 @@ def preprocess_label(buffer=16, mapping_layer=3):
         'C': [0., 0., 1., 0.],
         'G': [0., 0., 0., 1.],
     }
-    m_x = []
-    pi_x = []
-    is_binding = []
-    adjustment = []
-    evaluation = []
-    for b in binding[:3000]:
-        times = len(b["mRNA_seq"]) // MRNA_INPUT_LEN + 1 if len(b["mRNA_seq"]) % MRNA_INPUT_LEN != 0 else 0
-        for i in range(times):
-            pi_x.append(seq2onehot(b["piRNA_seq"], lut))
-            start = i * MRNA_INPUT_LEN
-            end = (i + 1) * MRNA_INPUT_LEN
-            # Processing input
-            if end > len(b["mRNA_seq"]): # Should pad zero here
-                valid = seq2onehot(b["mRNA_seq"][start:], lut)
-                padding = MRNA_INPUT_LEN - valid.shape[1]
-                z = np.zeros((4, padding))
-                m_x.append(np.concatenate((valid, z), axis=1))
-            else:
-                raw_seq = b["mRNA_seq"][start: end]
-                m_x.append(seq2onehot(raw_seq, lut))
-
-            # Processing is_binding
-            np.zeros(MRNA_INPUT_LEN)
-            is_binding.append(binding_label(b, start, end, buffer, 2 ** mapping_layer))
-            adjustment.append(adjustment_label(b, start, end, 0, 2 ** mapping_layer))
-            evaluation.append(eval_label(b, start, end, buffer, 2 ** mapping_layer))
-    return np.array(m_x), np.array(pi_x), np.array(is_binding), np.array(adjustment), np.array(evaluation)
+    m = []
+    pi = []
+    train_cls = []
+    train_adj = []
+    eval = []
+    print(f"total number of sample is {len(binding)}")
+    for b in binding[:30000]:
+        res = augment_binding(b, 8)
+        if not res["validity"]:
+            continue
+        m.append(res["mRNA"])
+        pi.append(seq2onehot(b["piRNA_seq"], lut))
+        train_cls.append(res["train_cls"])
+        train_adj.append(res["train_adj"])
+        eval.append(res["eval"])
+    return np.array(m), np.array(pi), np.array(train_cls), np.array(train_adj), np.array(eval)
 
 def split_dataset(valid_ratio, m_x, pi_x, is_binding, adjust):
     assert valid_ratio < 1
@@ -294,21 +246,25 @@ def get_next_batch(epoch, batch_size, m, pi, is_binding, adjust):
         for j in range(m.shape[0] // batch_size - 1):
             start = j * batch_size
             end = (j + 1) * batch_size
-            yield torch.tensor(m[start: end]), torch.tensor(pi[start: end]), torch.tensor(is_binding[start: end, :, 0]), torch.tensor(adjust[start: end]), do_valid
+            yield torch.tensor(m[start: end]), torch.tensor(pi[start: end]), torch.tensor(is_binding[start: end]), torch.tensor(adjust[start: end]), do_valid
             do_valid = False
 
 def train():
-    m_x, pi_x, is_binding, adjust, evaluation = preprocess_label()
-    tv, v_i = split_dataset(0.05, m_x, pi_x, is_binding, adjust)
+    m, pi, train_cls, train_adj, eval = preprocess_label()
+    print("m shape", m.shape)
+    print("pi shape", pi.shape)
+    print("b shape", train_cls.shape)
+    print("a shape", train_adj.shape)
+    print("e shape", eval.shape)
+    tv, v_i = split_dataset(0.1, m, pi, train_cls, train_adj)
     train_m, train_pi, train_binding, train_adjust = tv["train"]
     valid_m, valid_pi, valid_binding, valid_adjust = tv["valid"]
-    valid_binding = valid_binding[:, :, 0]
     valid_m = torch.tensor(valid_m).to(dev).float()
     valid_pi = torch.tensor(valid_pi).to(dev).float()
     valid_binding = torch.tensor(valid_binding).to(dev).long()
     valid_adjust = torch.tensor(valid_adjust).to(dev).float()
-    net = MPiNet(2, 0.25).to(dev)
-    optimizer = optim.SGD(net.parameters(), lr=0.01, momentum=0.9)
+    net = MPiNet(3.5, 0.05).to(dev)
+    optimizer = optim.SGD(net.parameters(), lr=0.005, momentum=0.9)
     i = 0
     for m, pi, bind_label, adj_label, do_valid in get_next_batch(EPOCH, BATCH_SIZE, train_m, train_pi, train_binding, train_adjust):
         m = m.to(dev).float()
@@ -323,8 +279,11 @@ def train():
         if do_valid:
             net.eval()
             pred_cls, pred_adj, l = net(valid_m, valid_pi, valid_binding, valid_adjust)
-            f1 = metrics.f1_score(evaluation[v_i].reshape(-1), inverse_affine_predict(pred_cls, pred_adj, 8).reshape(-1))
-            print(f"#{i:3d} evaluate: {f1}, loss: {l}")
+            answer = eval[v_i].reshape(-1)
+            predict = inverse_affine_predict(pred_cls, pred_adj, 8).reshape(-1)
+            f1 = metrics.f1_score(answer, predict)
+            acc = metrics.accuracy_score(answer, predict)
+            print(f"#{i:3d} f1: {f1} acc: {acc}, , loss: {l}")
             i += 1
 
 
