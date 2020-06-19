@@ -14,7 +14,7 @@ from math import floor, ceil
 MRNA_INPUT_LEN = 1024
 PIRNA_INPUT_LEN = 21
 EPOCH = 2000
-BATCH_SIZE = 64
+BATCH_SIZE = 16
 THRESHOLD = 0.8
 dev = torch.device("cuda:0")
 
@@ -66,30 +66,33 @@ class PyramidNet(nn.Module):
 class BoxNet(nn.Module):
     def __init__(self, mapping_layer=3):
         super(BoxNet, self).__init__()
-        self.pi_conv1 = nn.Conv1d(4, 8, 5, padding=2)
+        self.get_weight = nn.Conv1d(3, 1, 3, padding=1)
+        self.pi_conv1 = nn.Conv1d(4, 2, 3, padding=1)
         self.pi_shrink = nn.Linear(PIRNA_INPUT_LEN, 16)
         self.pi_enlarge = nn.Linear(16, 128)
 
-        self.cls_conv1 = nn.Conv1d(24, 32, 3, padding=1)
-        self.cls_conv2 = nn.Conv1d(32, 16, 3, padding=1)
+        self.cls_conv1 = nn.Conv1d(3, 16, 3, padding=1)
+        self.cls_conv2 = nn.Conv1d(16, 16, 3, padding=1)
         self.cls_conv3 = nn.Conv1d(16, 2, 3, padding=1)
 
-        self.adj_conv1 = nn.Conv1d(24, 32, 3, padding=1)
-        self.adj_conv2 = nn.Conv1d(32, 16, 3, padding=1)
+        self.adj_conv1 = nn.Conv1d(3, 16, 3, padding=1)
+        self.adj_conv2 = nn.Conv1d(16, 16, 3, padding=1)
         self.adj_conv3 = nn.Conv1d(16, 2, 3, padding=1)
-        self.softmax = nn.Softmax(dim=2)
 
     def forward(self, piRNA, pyramid_fmap):
+        pyramid_fmap = torch.mean(pyramid_fmap, dim=1, keepdim=True)
         pi_fmap = self.pi_conv1(piRNA)
         pi_fmap = self.pi_shrink(pi_fmap)
         pi_fmap = self.pi_enlarge(pi_fmap)
-        box_in = torch.cat((pi_fmap, pyramid_fmap), dim=1)
+        attention_in = torch.cat((pi_fmap, pyramid_fmap), dim=1)
+        w = self.get_weight(attention_in)
+        pyramid_fmap = w * pyramid_fmap
+        box_in = torch.cat((pyramid_fmap, pi_fmap), dim = 1)
 
         cls_o = self.cls_conv1(box_in)
         cls_o = self.cls_conv2(cls_o)
         cls_o = self.cls_conv3(cls_o)
         cls_o = torch.transpose(cls_o, 1, 2)
-        cls_o = self.softmax(cls_o)
         # print(cls_o.shape)
 
         adj_o = self.adj_conv1(box_in)
@@ -113,7 +116,7 @@ class MPiNet(nn.Module):
         pred_cls, pred_adj = self.box(pi_x, out)
         fl = focal_loss(self.alpha, self.gamma, 2)(pred_cls, binding_label)
         sl = nn.functional.smooth_l1_loss(pred_adj, adjust_label)
-        return pred_cls, pred_adj, fl + sl
+        return pred_cls, pred_adj, fl + 2*sl
 
 
 def get_binding():
@@ -142,19 +145,58 @@ def get_binding():
         pos_binding.append(binding)
     return pos_binding
 
-def inverse_affine_predict(pred_cls, pred_adj, ratio):
-    output_cls = np.argmax(pred_cls.cpu().detach().numpy(), axis=2)
-    uni, cnt = np.unique(output_cls, return_counts=True)
-    print(dict(zip(uni, cnt)))
-    output_adj = pred_adj.cpu().detach().numpy()
+def test_inverse(output_cls, output_adj, ratio):
     output = np.zeros((output_cls.shape[0], MRNA_INPUT_LEN))
     for s in range(output_cls.shape[0]):
         for i, c in enumerate(output_cls[s]):
             if c == 1:
-                f = int(output_adj[s, i, 0] * ratio)
+                f = int(output_adj[s, i, 0] + i * ratio)
                 l = int(output_adj[s, i, 1] + ratio)
-                e = min(f+l, MRNA_INPUT_LEN // ratio)
+                e = min(f+l, MRNA_INPUT_LEN)
+                print(s, f, l, e)
+                output[s, f: e] = 1.
+    return output
+
+g_valid_times = 0
+
+def inverse_affine_predict(pred_cls, pred_adj, ratio):
+    global g_valid_times
+    print("shape of predict ", pred_cls.shape)
+    # pred_cls = nn.Softmax(dim=2)(pred_cls)
+    pred_cls = pred_cls.cpu().detach().numpy()
+    output_cls = np.argmax(pred_cls, axis=2)
+    primary_box = np.argmax(pred_cls[:, :, 0], axis=1)
+    uni, cnt = np.unique(output_cls, return_counts=True)
+    output_adj = pred_adj.cpu().detach().numpy()
+    output = np.zeros((output_cls.shape[0], MRNA_INPUT_LEN))
+    print(dict(zip(uni, cnt)))
+    box_cnt = {}
+    # if 1 in uni:
+    #     for i, p in enumerate(primary_box):
+    #         f = int(output_adj[i, p, 0] + p * ratio)
+    #         l = int(output_adj[i, p, 1] + ratio)
+    #         # l = 21
+    #         e = min(f+l, MRNA_INPUT_LEN)
+    #         if (f, e) in box_cnt.keys():
+    #             box_cnt[(f,e)] += 1
+    #         else:
+    #             box_cnt[(f,e)] = 1
+    #         output[i, f: e] = 1
+
+    # print(box_len)
+    # print(f"f{box_cnt}")
+    if g_valid_times == 2:
+        print(output_cls[0])
+        print(pred_cls[0])
+        sys.exit()
+    for s in range(output_cls.shape[0]):
+        for i, c in enumerate(output_cls[s]):
+            if c == 1 and pred_cls[s, i, 0] > 0.8:
+                f = int(output_adj[s, i, 0] * MRNA_INPUT_LEN + i * ratio)
+                l = int(output_adj[s, i, 1] + ratio)
+                e = min(f+l, MRNA_INPUT_LEN)
                 output[s, f: e] = 1
+    g_valid_times += 1
     return output
 
 def seq2onehot(seq, lut):
@@ -170,21 +212,20 @@ def augment_binding(bind, ratio):
     if n_window < 0:
         return {"validity": False}
     start_i = bind["site_location"]["from"] - former_space + randint(0, n_window)
-
+    # print(start_i, bind["site_location"])
     eval = np.zeros(MRNA_INPUT_LEN)
     eval[bind["site_location"]["from"] - start_i: bind["site_location"]["to"]] = 1.
 
+    valid_start = floor((bind["site_location"]["from"] - start_i) / ratio)
+    valid_end = ceil((bind["site_location"]["to"] - start_i) / ratio)
     train_cls = np.zeros(MRNA_INPUT_LEN // ratio)
-    train_cls[
-        floor(bind["site_location"]["from"] / ratio):
-        ceil(bind["site_location"]["to"] / ratio)
-    ] = 1.
+    train_cls[valid_start: valid_end] = 1.
 
     train_adj = []
     for i in range(MRNA_INPUT_LEN // ratio):
         train_adj.append([
-            bind["site_location"]["from"] - (i * ratio + start_i),
-            len(bind["site_seq"]) / ratio
+            (bind["site_location"]["from"] - (i * ratio + start_i)) / MRNA_INPUT_LEN,
+            (len(bind["site_seq"]) - ratio)
         ])
     lut = {
         'A': [1., 0., 0., 0.],
@@ -256,6 +297,8 @@ def train():
     print("b shape", train_cls.shape)
     print("a shape", train_adj.shape)
     print("e shape", eval.shape)
+    # print(f"{np.array_equal(eval, test_inverse(train_cls, train_adj, 8))}")
+    # sys.exit()
     tv, v_i = split_dataset(0.1, m, pi, train_cls, train_adj)
     train_m, train_pi, train_binding, train_adjust = tv["train"]
     valid_m, valid_pi, valid_binding, valid_adjust = tv["valid"]
@@ -263,9 +306,11 @@ def train():
     valid_pi = torch.tensor(valid_pi).to(dev).float()
     valid_binding = torch.tensor(valid_binding).to(dev).long()
     valid_adjust = torch.tensor(valid_adjust).to(dev).float()
-    net = MPiNet(3.5, 0.05).to(dev)
-    optimizer = optim.SGD(net.parameters(), lr=0.005, momentum=0.9)
+    net = MPiNet(3, 0.04).to(dev)
+    optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
     i = 0
+    total_pred_clas = []
+    total_true_clas = []
     for m, pi, bind_label, adj_label, do_valid in get_next_batch(EPOCH, BATCH_SIZE, train_m, train_pi, train_binding, train_adjust):
         m = m.to(dev).float()
         pi = pi.to(dev).float()
@@ -273,17 +318,21 @@ def train():
         adj_label = adj_label.to(dev).float()
         net.train()
         pred_cls, _, loss = net(m, pi, bind_label, adj_label)
+        # total_pred_clas.append(pred_cls)
+        # total_true_clas.append()
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         if do_valid:
+            total_pred_clas = []
             net.eval()
             pred_cls, pred_adj, l = net(valid_m, valid_pi, valid_binding, valid_adjust)
             answer = eval[v_i].reshape(-1)
             predict = inverse_affine_predict(pred_cls, pred_adj, 8).reshape(-1)
             f1 = metrics.f1_score(answer, predict)
             acc = metrics.accuracy_score(answer, predict)
-            print(f"#{i:3d} f1: {f1} acc: {acc}, , loss: {l}")
+            recall = metrics.recall_score(answer, predict)
+            print(f"#{i:3d} f1: {f1:.4f} acc: {acc:.4f}, recall: {recall:.4f}, loss: {l}")
             i += 1
 
 
