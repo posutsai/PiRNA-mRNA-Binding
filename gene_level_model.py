@@ -311,6 +311,7 @@ def train():
     i = 0
     total_pred_clas = []
     total_true_clas = []
+    optimizer.zero_grad()
     for m, pi, bind_label, adj_label, do_valid in get_next_batch(EPOCH, BATCH_SIZE, train_m, train_pi, train_binding, train_adjust):
         m = m.to(dev).float()
         pi = pi.to(dev).float()
@@ -320,7 +321,6 @@ def train():
         pred_cls, _, loss = net(m, pi, bind_label, adj_label)
         # total_pred_clas.append(pred_cls)
         # total_true_clas.append()
-        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         if do_valid:
